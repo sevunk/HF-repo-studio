@@ -1,0 +1,2235 @@
+app.tsx
+
+import React, { useState, useEffect, useMemo } from 'react';
+import {
+  Clock, ArrowRightLeft, Key, ShieldCheck, AlertTriangle, CheckCircle2,
+  RotateCcw, Trash2, FolderGit2, FileBox, Search, Sun, Moon, ExternalLink,
+  Copy, Check, RefreshCw, Sparkles, ShieldAlert, HardDrive, ArrowRight,
+  ChevronDown, ChevronUp, Plus, Info, Lock, Unlock, LogOut, Eye, EyeOff
+} from 'lucide-react';
+
+// ============================================================================
+// 🧩 TIPE DATA & INTERFACES
+// ============================================================================
+type RepoType = 'model' | 'dataset' | 'space';
+
+interface HfUserInfo {
+  name: string;
+  fullname?: string;
+  avatarUrl?: string;
+  orgs?: { name: string }[];
+}
+
+interface HfRepoSummary {
+  id: string;
+  type: RepoType;
+  private: boolean;
+  updatedAt?: string;
+}
+
+interface HfFileItem {
+  path: string;
+  size: number;
+  hash: string;
+  fullHash: string;
+  isLfs: boolean;
+  lfsOid?: string;
+  lfsSize?: number;
+  xetHash?: string;
+}
+
+interface HfCommitInfo {
+  index: number;
+  commitId: string;
+  shortId: string;
+  title: string;
+  message: string;
+  createdAt: string;
+  wibTime: string;
+  files: Record<string, HfFileItem>;
+  diff?: {
+    added: HfFileItem[];
+    deleted: { file: HfFileItem; rescueCommitId: string; rescueIndex: number }[];
+    overwritten: {
+      path: string;
+      oldFile: HfFileItem;
+      newFile: HfFileItem;
+      rescueCommitId: string;
+      rescueIndex: number;
+    }[];
+  };
+}
+
+interface RescueHint {
+  type: 'OVERWRITTEN' | 'DELETED';
+  path: string;
+  happenedAtCommitIdx: number;
+  happenedAtShortId: string;
+  rescueCommitIdx: number;
+  rescueCommitId: string;
+  rescueShortId: string;
+  oldFile: HfFileItem;
+  newFile?: HfFileItem;
+}
+
+// ============================================================================
+// 🛠️ FUNGSI UTILITAS & PARSER URL HUGGING FACE
+// ============================================================================
+const HF_BASE = 'https://huggingface.co';
+
+function formatSize(bytes?: number): string {
+  if (bytes === undefined || bytes === null || isNaN(bytes)) return '0 B';
+  if (bytes >= 1024 ** 3) {
+    return `${(bytes / 1024 ** 3).toFixed(2)} GiB (${(bytes / 1e9).toFixed(2)} GB)`;
+  }
+  if (bytes >= 1024 ** 2) {
+    return `${(bytes / 1024 ** 2).toFixed(2)} MB`;
+  }
+  if (bytes >= 1024) {
+    return `${(bytes / 1024).toFixed(1)} KB`;
+  }
+  return `${bytes} B`;
+}
+
+function formatWib(isoDate?: string): string {
+  if (!isoDate) return '-';
+  try {
+    const dt = new Date(isoDate);
+    return new Intl.DateTimeFormat('id-ID', {
+      timeZone: 'Asia/Jakarta',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false,
+    }).format(dt) + ' WIB';
+  } catch {
+    return isoDate;
+  }
+}
+
+function parseHfInput(
+  rawRepoOrUrl: string,
+  rawSubpath: string,
+  defaultType: RepoType,
+  defaultRev: string
+): { repoId: string; repoType: RepoType; revision: string; subpath: string } {
+  const raw = (rawRepoOrUrl || '').trim();
+  const sub = (rawSubpath || '').trim().replace(/^\/+|\/+$/g, '');
+  let repoType: RepoType = defaultType;
+  let revision = (defaultRev || 'main').trim() || 'main';
+
+  if (raw.startsWith('http://') || raw.startsWith('https://')) {
+    const cleanUrl = raw.split('?')[0].replace(/\/+$/, '');
+    const parsed = new URL(cleanUrl);
+    let parts = parsed.pathname
+      .split('/')
+      .filter(Boolean)
+      .map((p) => decodeURIComponent(p));
+
+    if (parts.length > 0 && ['datasets', 'spaces', 'models'].includes(parts[0])) {
+      const map: Record<string, RepoType> = {
+        datasets: 'dataset',
+        spaces: 'space',
+        models: 'model',
+      };
+      repoType = map[parts[0]];
+      parts = parts.slice(1);
+    }
+
+    if (parts.length < 2) {
+      throw new Error(`URL Hugging Face tidak valid: ${raw}`);
+    }
+
+    const repoId = `${parts[0]}/${parts[1]}`;
+    let urlSubpath = '';
+    if (parts.length >= 4 && ['blob', 'resolve', 'tree', 'commits'].includes(parts[2])) {
+      revision = parts[3];
+      urlSubpath = parts.slice(4).join('/');
+    } else if (parts.length > 2) {
+      urlSubpath = parts.slice(2).join('/');
+    }
+
+    return {
+      repoId,
+      repoType,
+      revision,
+      subpath: sub || urlSubpath,
+    };
+  }
+
+  const cleanRaw = raw.startsWith('hf://') ? raw.slice(5) : raw;
+  let parts = cleanRaw.split('/').filter(Boolean);
+  if (parts.length > 0 && ['datasets', 'spaces', 'models'].includes(parts[0])) {
+    const map: Record<string, RepoType> = {
+      datasets: 'dataset',
+      spaces: 'space',
+      models: 'model',
+    };
+    repoType = map[parts[0]];
+    parts = parts.slice(1);
+  }
+
+  if (parts.length < 2) {
+    throw new Error(`Format repo_id tidak valid: "${raw}". Gunakan format "username/nama-repo".`);
+  }
+
+  const repoId = `${parts[0]}/${parts[1]}`;
+  const inlineSubpath = parts.length > 2 ? parts.slice(2).join('/') : '';
+  return {
+    repoId,
+    repoType,
+    revision,
+    subpath: sub || inlineSubpath,
+  };
+}
+
+function arrayBufferToBase64(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
+function repoApiPrefix(repoType: RepoType, repoId: string): string {
+  const [owner, name] = repoId.split('/');
+  return `${HF_BASE}/api/${repoType}s/${encodeURIComponent(owner)}/${encodeURIComponent(name)}`;
+}
+
+function repoWebUrl(repoType: RepoType, repoId: string, rev = 'main', subpath = ''): string {
+  const prefix = repoType === 'dataset' ? 'datasets/' : repoType === 'space' ? 'spaces/' : '';
+  const cleanSub = subpath ? `/${subpath.replace(/^\/+/, '')}` : '';
+  return `${HF_BASE}/${prefix}${repoId}/tree/${encodeURIComponent(rev)}${cleanSub}`;
+}
+
+function repoResolveUrl(repoType: RepoType, repoId: string, rev: string, filePath: string): string {
+  const prefix = repoType === 'dataset' ? 'datasets/' : repoType === 'space' ? 'spaces/' : '';
+  const encodedPath = filePath.split('/').map(encodeURIComponent).join('/');
+  return `${HF_BASE}/${prefix}${repoId}/resolve/${encodeURIComponent(rev)}/${encodedPath}`;
+}
+
+// ============================================================================
+// 🌐 HUGGING FACE HUB REST API HELPERS (CLIENT-SIDE)
+// ============================================================================
+async function hfFetchJson(url: string, token: string, init?: RequestInit) {
+  const headers: Record<string, string> = {
+    Accept: 'application/json',
+    ...(init?.headers as Record<string, string>),
+  };
+  if (token.trim()) {
+    headers['Authorization'] = `Bearer ${token.trim()}`;
+  }
+  const resp = await fetch(url, { ...init, headers });
+  if (!resp.ok) {
+    let errText = '';
+    try {
+      const j = await resp.json();
+      errText = j.error || JSON.stringify(j);
+    } catch {
+      errText = await resp.text();
+    }
+    throw new Error(`HTTP ${resp.status}: ${errText || resp.statusText}`);
+  }
+  const text = await resp.text();
+  return text ? JSON.parse(text) : {};
+}
+
+async function fetchCommitFileMap(
+  repoId: string,
+  repoType: RepoType,
+  revision: string,
+  token: string
+): Promise<Record<string, HfFileItem>> {
+  const url = `${repoApiPrefix(repoType, repoId)}/tree/${encodeURIComponent(revision)}?recursive=true`;
+  const tree = await hfFetchJson(url, token);
+  const map: Record<string, HfFileItem> = {};
+  if (!Array.isArray(tree)) return map;
+
+  for (const item of tree) {
+    if (item.type === 'file' && item.path !== '.gitattributes') {
+      const lfs = item.lfs;
+      const isLfs = Boolean(lfs && lfs.oid);
+      const fullHash = isLfs ? String(lfs.oid) : String(item.oid || '-');
+      map[item.path] = {
+        path: item.path,
+        size: Number(lfs?.size ?? item.size ?? 0),
+        hash: fullHash.slice(0, 10),
+        fullHash,
+        isLfs,
+        lfsOid: lfs?.oid,
+        lfsSize: lfs?.size ?? item.size,
+        xetHash: item.xetHash,
+      };
+    }
+  }
+  return map;
+}
+
+async function fetchPathsInfoDetailed(
+  repoId: string,
+  repoType: RepoType,
+  revision: string,
+  paths: string[],
+  token: string
+): Promise<Record<string, HfFileItem>> {
+  const result: Record<string, HfFileItem> = {};
+  if (paths.length === 0) return result;
+
+  const url = `${repoApiPrefix(repoType, repoId)}/paths-info/${encodeURIComponent(revision)}`;
+  const data = await hfFetchJson(url, token, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ paths, expand: true }),
+  });
+
+  if (Array.isArray(data)) {
+    for (const item of data) {
+      if (item && item.path) {
+        const lfs = item.lfs;
+        const isLfs = Boolean(lfs && lfs.oid);
+        const fullHash = isLfs ? String(lfs.oid) : String(item.oid || '-');
+        result[item.path] = {
+          path: item.path,
+          size: Number(lfs?.size ?? item.size ?? 0),
+          hash: fullHash.slice(0, 10),
+          fullHash,
+          isLfs,
+          lfsOid: lfs?.oid,
+          lfsSize: lfs?.size ?? item.size,
+          xetHash: item.xetHash,
+        };
+      }
+    }
+  }
+  return result;
+}
+
+async function ensureRepoExists(
+  repoId: string,
+  repoType: RepoType,
+  isPrivate: boolean,
+  token: string
+) {
+  const [owner, name] = repoId.split('/');
+  if (!owner || !name) throw new Error(`Format repo tujuan tidak valid: ${repoId}`);
+
+  // Cek apakah sudah ada
+  const checkUrl = `${repoApiPrefix(repoType, repoId)}`;
+  const headers: Record<string, string> = { Accept: 'application/json' };
+  if (token.trim()) headers['Authorization'] = `Bearer ${token.trim()}`;
+  const checkResp = await fetch(checkUrl, { headers });
+  if (checkResp.ok) return;
+
+  // Buat repo baru jika belum ada
+  const whoami = await hfFetchJson(`${HF_BASE}/api/whoami-v2`, token);
+  const currentUser = whoami.name || '';
+  const bodyPayload: Record<string, any> = {
+    name,
+    type: repoType,
+    private: isPrivate,
+  };
+  if (owner.toLowerCase() !== currentUser.toLowerCase()) {
+    bodyPayload.organization = owner;
+  }
+
+  const createResp = await fetch(`${HF_BASE}/api/repos/create`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token.trim()}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(bodyPayload),
+  });
+
+  if (!createResp.ok && createResp.status !== 409) {
+    const errTxt = await createResp.text();
+    throw new Error(`Gagal membuat repositori ${repoId}: HTTP ${createResp.status} ${errTxt}`);
+  }
+}
+
+async function executeNdjsonCommit(opts: {
+  srcRepoId: string;
+  srcRepoType: RepoType;
+  srcRevision: string;
+  dstRepoId: string;
+  dstRepoType: RepoType;
+  dstRevision: string;
+  copyPairs: { srcFile: HfFileItem; dstPath: string }[];
+  deletePaths: { path: string; isFolder: boolean }[];
+  commitMessage: string;
+  commitDescription?: string;
+  token: string;
+  onLog?: (msg: string) => void;
+}) {
+  const {
+    srcRepoId, srcRepoType, srcRevision,
+    dstRepoId, dstRepoType, dstRevision,
+    copyPairs, deletePaths, commitMessage, commitDescription, token, onLog
+  } = opts;
+
+  const sameRepo =
+    srcRepoId.toLowerCase() === dstRepoId.toLowerCase() && srcRepoType === dstRepoType;
+
+  // 1. Jika lintas repo dan ada file LFS, panggil endpoint lfs-files/duplicate untuk Server-Side Copy 0 GB
+  const lfsPairs = copyPairs.filter((p) => p.srcFile.isLfs && p.srcFile.lfsOid);
+  if (!sameRepo && lfsPairs.length > 0) {
+    onLog?.(`⚡ Mengonfigurasi Server-Side LFS/Xet Duplicate untuk ${lfsPairs.length} file besar...`);
+    const detailedMap = await fetchPathsInfoDetailed(
+      srcRepoId,
+      srcRepoType,
+      srcRevision,
+      lfsPairs.map((p) => p.srcFile.path),
+      token
+    );
+
+    const filesToDuplicate = lfsPairs
+      .map((p) => {
+        const d = detailedMap[p.srcFile.path] || p.srcFile;
+        return {
+          xetHash: d.xetHash,
+          sha256: d.lfsOid || d.fullHash,
+          filename: p.srcFile.path,
+        };
+      })
+      .filter((x) => x.sha256);
+
+    if (filesToDuplicate.length > 0) {
+      const dupUrl = `${repoApiPrefix(srcRepoType, srcRepoId)}/lfs-files/duplicate`;
+      try {
+        await hfFetchJson(dupUrl, token, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            target: { type: dstRepoType, name: dstRepoId },
+            files: filesToDuplicate,
+          }),
+        });
+      } catch (dupErr: any) {
+        onLog?.(`ℹ️ Info storage duplicate: ${dupErr.message} (Melanjutkan commit pointer LFS...)`);
+      }
+    }
+  }
+
+  // 2. Susun baris NDJSON
+  const records: any[] = [
+    {
+      key: 'header',
+      value: {
+        summary: commitMessage,
+        description: commitDescription || '',
+      },
+    },
+  ];
+
+  for (const pair of copyPairs) {
+    const f = pair.srcFile;
+    if (f.isLfs && f.lfsOid) {
+      records.push({
+        key: 'lfsFile',
+        value: {
+          path: pair.dstPath,
+          algo: 'sha256',
+          oid: f.lfsOid,
+          size: f.lfsSize ?? f.size,
+        },
+      });
+    } else {
+      // File non-LFS kecil (misal README.md, .json, .csv): ambil via resolve dan encode base64
+      onLog?.(`📄 Menyalin file teks/non-LFS (${formatSize(f.size)}): ${f.path} ...`);
+      const rawUrl = repoResolveUrl(srcRepoType, srcRepoId, srcRevision, f.path);
+      const headers: Record<string, string> = {};
+      if (token.trim()) headers['Authorization'] = `Bearer ${token.trim()}`;
+      const resp = await fetch(rawUrl, { headers });
+      if (!resp.ok) {
+        throw new Error(`Gagal membaca file non-LFS ${f.path} (HTTP ${resp.status})`);
+      }
+      const buf = await resp.arrayBuffer();
+      const b64 = arrayBufferToBase64(buf);
+      records.push({
+        key: 'file',
+        value: {
+          content: b64,
+          path: pair.dstPath,
+          encoding: 'base64',
+        },
+      });
+    }
+  }
+
+  for (const del of deletePaths) {
+    records.push({
+      key: del.isFolder ? 'deletedFolder' : 'deletedFile',
+      value: { path: del.path },
+    });
+  }
+
+  const ndjsonBody = records.map((r) => JSON.stringify(r)).join('\n') + '\n';
+  const commitUrl = `${repoApiPrefix(dstRepoType, dstRepoId)}/commit/${encodeURIComponent(dstRevision)}`;
+
+  onLog?.(`🚀 Mengirim Atomic Commit ke ${dstRepoId} (${dstRevision})...`);
+  return await hfFetchJson(commitUrl, token, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-ndjson' },
+    body: ndjsonBody,
+  });
+}
+
+// ============================================================================
+// 🎨 KOMPONEN UTAMA REACT UI
+// ============================================================================
+export default function App() {
+  const [isDark, setIsDark] = useState(true);
+  const [activeStudioTab, setActiveStudioTab] = useState<'timemachine' | 'mover'>('timemachine');
+
+  // --- STATE AUTENTIKASI & DAFTAR REPO PENGGUNA ---
+  const [hfToken, setHfToken] = useState<string>(() => localStorage.getItem('hf_studio_token') || '');
+  const [rememberToken, setRememberToken] = useState<boolean>(() => Boolean(localStorage.getItem('hf_studio_token')));
+  const [showToken, setShowToken] = useState(false);
+  const [userInfo, setUserInfo] = useState<HfUserInfo | null>(null);
+  const [userRepos, setUserRepos] = useState<HfRepoSummary[]>([]);
+  const [authLoading, setAuthLoading] = useState(false);
+  const [authError, setAuthError] = useState<string | null>(null);
+
+  // --- STATE TAB 1: HF TIME MACHINE ---
+  const [tmRepoInput, setTmRepoInput] = useState('SEVUNX/aestkr2');
+  const [tmRepoType, setTmRepoType] = useState<RepoType>('model');
+  const [tmBranch, setTmBranch] = useState('main');
+  const [tmMaxCommits, setTmMaxCommits] = useState(8);
+  const [tmLoading, setTmLoading] = useState(false);
+  const [tmError, setTmError] = useState<string | null>(null);
+  const [tmCommits, setTmCommits] = useState<HfCommitInfo[]>([]);
+  const [tmTotalCommits, setTmTotalCommits] = useState(0);
+  const [tmRescueHints, setTmRescueHints] = useState<RescueHint[]>([]);
+  const [expandedCommits, setExpandedCommits] = useState<Record<string, boolean>>({});
+
+  // Form Pemulihan (Restore Drawer/Panel)
+  const [restoreCommitId, setRestoreCommitId] = useState('');
+  const [restoreSrcPath, setRestoreSrcPath] = useState('');
+  const [restoreNewName, setRestoreNewName] = useState('');
+  const [restoreConflictMode, setRestoreConflictMode] = useState<'OVERWRITE' | 'SUFFIX_PULIH' | 'ABORT'>('OVERWRITE');
+  const [restoreExtraDeletes, setRestoreExtraDeletes] = useState('');
+  const [restoreStatus, setRestoreStatus] = useState<{ loading: boolean; logs: string[]; successUrl?: string; error?: string }>({
+    loading: false,
+    logs: [],
+  });
+
+  // --- STATE TAB 2: HF REPO-TO-REPO MOVER & RENAMER ---
+  const [mvSrcRepoInput, setMvSrcRepoInput] = useState('SEVUNX/redkrea');
+  const [mvSrcPathInput, setMvSrcPathInput] = useState('');
+  const [mvSrcType, setMvSrcType] = useState<RepoType>('model');
+  const [mvSrcBranch, setMvSrcBranch] = useState('main');
+  const [mvSrcFilesMap, setMvSrcFilesMap] = useState<Record<string, HfFileItem>>({});
+  const [mvSelectedPaths, setMvSelectedPaths] = useState<Set<string>>(new Set());
+  const [mvLoadingFiles, setMvLoadingFiles] = useState(false);
+  const [mvFileSearch, setMvFileSearch] = useState('');
+
+  const [mvDstRepoInput, setMvDstRepoInput] = useState('SEVUNX/aestkr2');
+  const [mvDstNewName, setMvDstNewName] = useState('');
+  const [mvDstType, setMvDstType] = useState<RepoType>('model');
+  const [mvDstBranch, setMvDstBranch] = useState('main');
+  const [mvPrivateTarget, setMvPrivateTarget] = useState(false);
+  const [mvCollisionMode, setMvCollisionMode] = useState<'STOP_BATALKAN' | 'AUTO_RENAME' | 'OVERWRITE_TIMPA'>('STOP_BATALKAN');
+  const [mvDeleteSource, setMvDeleteSource] = useState(false);
+  const [mvStatus, setMvStatus] = useState<{ loading: boolean; logs: string[]; successUrl?: string; downloadUrl?: string; error?: string }>({
+    loading: false,
+    logs: [],
+  });
+
+  // Simpan/hapus token di localStorage sesuai preferensi pengguna
+  useEffect(() => {
+    if (rememberToken && hfToken.trim()) {
+      localStorage.setItem('hf_studio_token', hfToken.trim());
+    } else {
+      localStorage.removeItem('hf_studio_token');
+    }
+  }, [hfToken, rememberToken]);
+
+  // Fungsi Verifikasi Token & Ambil Daftar Repo Pengguna
+  const handleVerifyToken = async (tokenToUse = hfToken) => {
+    const clean = tokenToUse.trim();
+    if (!clean) {
+      setUserInfo(null);
+      setUserRepos([]);
+      return;
+    }
+    setAuthLoading(true);
+    setAuthError(null);
+    try {
+      const info = await hfFetchJson(`${HF_BASE}/api/whoami-v2`, clean);
+      setUserInfo({
+        name: info.name,
+        fullname: info.fullname,
+        avatarUrl: info.avatarUrl,
+        orgs: info.orgs,
+      });
+
+      // Ambil daftar model, dataset, space milik user secara paralel
+      const [models, datasets, spaces] = await Promise.all([
+        hfFetchJson(`${HF_BASE}/api/models?author=${encodeURIComponent(info.name)}&limit=100`, clean).catch(() => []),
+        hfFetchJson(`${HF_BASE}/api/datasets?author=${encodeURIComponent(info.name)}&limit=50`, clean).catch(() => []),
+        hfFetchJson(`${HF_BASE}/api/spaces?author=${encodeURIComponent(info.name)}&limit=50`, clean).catch(() => []),
+      ]);
+
+      const combined: HfRepoSummary[] = [
+        ...(Array.isArray(models) ? models.map((m: any) => ({ id: m.id, type: 'model' as RepoType, private: Boolean(m.private) })) : []),
+        ...(Array.isArray(datasets) ? datasets.map((d: any) => ({ id: d.id, type: 'dataset' as RepoType, private: Boolean(d.private) })) : []),
+        ...(Array.isArray(spaces) ? spaces.map((s: any) => ({ id: s.id, type: 'space' as RepoType, private: Boolean(s.private) })) : []),
+      ];
+      setUserRepos(combined);
+    } catch (err: any) {
+      setUserInfo(null);
+      setAuthError(`Token tidak valid atau gagal menghubungi HF: ${err.message}`);
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (hfToken.trim()) {
+      handleVerifyToken(hfToken);
+    }
+  }, []);
+
+  // ============================================================================
+  // 🔍 LOGIKA TAB 1: INSPEKSI RIWAYAT COMMIT & TIME MACHINE
+  // ============================================================================
+  const handleInspectCommits = async () => {
+    setTmLoading(true);
+    setTmError(null);
+    setTmCommits([]);
+    setTmRescueHints([]);
+
+    try {
+      const parsed = parseHfInput(tmRepoInput, '', tmRepoType, tmBranch);
+      setTmRepoInput(parsed.repoId);
+      setTmRepoType(parsed.repoType);
+      setTmBranch(parsed.revision);
+
+      const commitsUrl = `${repoApiPrefix(parsed.repoType, parsed.repoId)}/commits/${encodeURIComponent(parsed.revision)}`;
+      const allCommits = await hfFetchJson(commitsUrl, hfToken);
+      if (!Array.isArray(allCommits) || allCommits.length === 0) {
+        throw new Error(`Tidak ada riwayat commit ditemukan pada ${parsed.repoId} (${parsed.revision}).`);
+      }
+
+      setTmTotalCommits(allCommits.length);
+      const fetchCount = Math.min(allCommits.length, tmMaxCommits + 1);
+      const targetCommits = allCommits.slice(0, fetchCount);
+
+      // Ambil tree file untuk masing-masing commit secara paralel
+      const snapshots = await Promise.all(
+        targetCommits.map((c: any) =>
+          fetchCommitFileMap(parsed.repoId, parsed.repoType, c.id, hfToken).catch(() => ({} as Record<string, HfFileItem>))
+        )
+      );
+
+      const shownCount = Math.min(allCommits.length, tmMaxCommits);
+      const builtCommits: HfCommitInfo[] = [];
+      const hints: RescueHint[] = [];
+      const defaultExpanded: Record<string, boolean> = {};
+
+      for (let idx = 0; idx < shownCount; idx++) {
+        const c = allCommits[idx];
+        const currFiles = snapshots[idx] || {};
+        const prevFiles = idx + 1 < snapshots.length ? snapshots[idx + 1] : undefined;
+
+        const commitObj: HfCommitInfo = {
+          index: idx,
+          commitId: c.id,
+          shortId: String(c.id).slice(0, 8),
+          title: c.title || '(Tanpa judul commit)',
+          message: c.message || '',
+          createdAt: c.date,
+          wibTime: formatWib(c.date),
+          files: currFiles,
+        };
+
+        if (idx < 2) {
+          defaultExpanded[c.id] = true;
+        }
+
+        if (prevFiles) {
+          const prevCommit = allCommits[idx + 1];
+          const prevShortId = String(prevCommit.id).slice(0, 8);
+
+          const added: HfFileItem[] = [];
+          const deleted: NonNullable<HfCommitInfo['diff']>['deleted'] = [];
+          const overwritten: NonNullable<HfCommitInfo['diff']>['overwritten'] = [];
+
+          for (const [p, fInfo] of Object.entries(currFiles)) {
+            if (!(p in prevFiles)) {
+              added.push(fInfo);
+            } else if (fInfo.fullHash !== prevFiles[p].fullHash) {
+              overwritten.push({
+                path: p,
+                oldFile: prevFiles[p],
+                newFile: fInfo,
+                rescueCommitId: prevCommit.id,
+                rescueIndex: idx + 1,
+              });
+              hints.push({
+                type: 'OVERWRITTEN',
+                path: p,
+                happenedAtCommitIdx: idx,
+                happenedAtShortId: commitObj.shortId,
+                rescueCommitIdx: idx + 1,
+                rescueCommitId: prevCommit.id,
+                rescueShortId: prevShortId,
+                oldFile: prevFiles[p],
+                newFile: fInfo,
+              });
+            }
+          }
+
+          for (const [p, oldInfo] of Object.entries(prevFiles)) {
+            if (!(p in currFiles)) {
+              deleted.push({
+                file: oldInfo,
+                rescueCommitId: prevCommit.id,
+                rescueIndex: idx + 1,
+              });
+              hints.push({
+                type: 'DELETED',
+                path: p,
+                happenedAtCommitIdx: idx,
+                happenedAtShortId: commitObj.shortId,
+                rescueCommitIdx: idx + 1,
+                rescueCommitId: prevCommit.id,
+                rescueShortId: prevShortId,
+                oldFile: oldInfo,
+              });
+            }
+          }
+
+          commitObj.diff = { added, deleted, overwritten };
+        }
+
+        builtCommits.push(commitObj);
+      }
+
+      setExpandedCommits(defaultExpanded);
+      setTmCommits(builtCommits);
+      setTmRescueHints(hints);
+    } catch (err: any) {
+      setTmError(err.message || String(err));
+    } finally {
+      setTmLoading(false);
+    }
+  };
+
+  // Fungsi Pilih Cepat Tombol "1-Click Restore" ke Form Restore
+  const handleSelectForRestore = (commitId: string, filePath: string) => {
+    setRestoreCommitId(commitId.slice(0, 8));
+    setRestoreSrcPath(filePath);
+    setRestoreNewName('');
+    const el = document.getElementById('restore-action-panel');
+    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  };
+
+  // Fungsi Eksekusi Pemulihan (Mode 2 Time Machine)
+  const handleExecuteRestore = async () => {
+    if (!hfToken.trim()) {
+      setRestoreStatus({ loading: false, logs: [], error: 'Harap masukkan HF_TOKEN dengan izin Write terlebih dahulu di bagian atas halaman!' });
+      return;
+    }
+
+    const logs: string[] = [];
+    const pushLog = (msg: string) => {
+      logs.push(msg);
+      setRestoreStatus((prev) => ({ ...prev, logs: [...logs] }));
+    };
+
+    setRestoreStatus({ loading: true, logs: ['🔎 Memvalidasi parameter pemulihan...'] });
+
+    try {
+      const parsed = parseHfInput(tmRepoInput, '', tmRepoType, tmBranch);
+      const rawChoice = restoreCommitId.trim().replace(/^\[|\]$/g, '');
+      const srcPathClean = restoreSrcPath.trim().replace(/^\/+|\/+$/g, '');
+
+      if (!rawChoice) throw new Error('Pilih atau isi Kode Commit ID / Nomor Urut Commit terlebih dahulu!');
+      if (!srcPathClean) throw new Error('Isi nama file/folder yang ingin dipulihkan (atau ketik * untuk seluruh file)!');
+
+      const commitsUrl = `${repoApiPrefix(parsed.repoType, parsed.repoId)}/commits/${encodeURIComponent(parsed.revision)}`;
+      const allCommits = await hfFetchJson(commitsUrl, hfToken);
+
+      let selectedCommit: any = null;
+      if (/^\d+$/.test(rawChoice) && Number(rawChoice) < allCommits.length) {
+        selectedCommit = allCommits[Number(rawChoice)];
+      } else {
+        selectedCommit = allCommits.find((c: any) => String(c.id).toLowerCase().startsWith(rawChoice.toLowerCase()));
+      }
+
+      if (!selectedCommit) {
+        throw new Error(`Commit "${rawChoice}" tidak ditemukan di repo ${parsed.repoId}.`);
+      }
+
+      const fullCommitId = selectedCommit.id;
+      const shortId = String(fullCommitId).slice(0, 8);
+      pushLog(`✅ Commit sumber ditemukan: ${shortId} ("${selectedCommit.title}")`);
+
+      const commitFilesMap = await fetchCommitFileMap(parsed.repoId, parsed.repoType, fullCommitId, hfToken);
+      let matchedPaths: string[] = [];
+      let isSingle = false;
+
+      if (srcPathClean === '*') {
+        matchedPaths = Object.keys(commitFilesMap).sort();
+      } else if (srcPathClean in commitFilesMap) {
+        matchedPaths = [srcPathClean];
+        isSingle = true;
+      } else {
+        const prefix = srcPathClean + '/';
+        matchedPaths = Object.keys(commitFilesMap).filter((p) => p.startsWith(prefix)).sort();
+      }
+
+      if (matchedPaths.length === 0) {
+        throw new Error(`File/folder "${srcPathClean}" tidak ditemukan di dalam Commit ${shortId}.`);
+      }
+
+      const currentHeadMap = await fetchCommitFileMap(parsed.repoId, parsed.repoType, parsed.revision, hfToken);
+      const currentHeadFiles = new Set(Object.keys(currentHeadMap));
+      const customDst = restoreNewName.trim().replace(/^\/+|\/+$/g, '');
+
+      const copyPairs: { srcFile: HfFileItem; dstPath: string }[] = [];
+
+      for (const sPath of matchedPaths) {
+        let dPath = sPath;
+        if (isSingle && customDst) {
+          const extMatch = sPath.match(/(\.[^./]+)$/);
+          const origExt = extMatch ? extMatch[1] : '';
+          const baseCustom = customDst.split('/').pop() || '';
+          dPath = origExt && !baseCustom.includes('.') ? customDst + origExt : customDst;
+        } else if (!isSingle && customDst && srcPathClean !== '*') {
+          const rel = sPath.startsWith(srcPathClean + '/') ? sPath.slice(srcPathClean.length + 1) : sPath;
+          dPath = `${customDst}/${rel}`;
+        }
+
+        if (currentHeadFiles.has(dPath)) {
+          if (restoreConflictMode === 'ABORT') {
+            throw new Error(`🛑 Pemulihan dibatalkan karena file "${dPath}" sudah ada di repo saat ini dan Anda memilih opsi BATALKAN.`);
+          } else if (restoreConflictMode === 'SUFFIX_PULIH') {
+            const dotIdx = dPath.lastIndexOf('.');
+            const stem = dotIdx !== -1 ? dPath.slice(0, dotIdx) : dPath;
+            const ext = dotIdx !== -1 ? dPath.slice(dotIdx) : '';
+            let candidate = `${stem}_PULIH${ext}`;
+            let cnt = 1;
+            while (currentHeadFiles.has(candidate)) {
+              candidate = `${stem}_PULIH_${cnt}${ext}`;
+              cnt++;
+            }
+            dPath = candidate;
+          }
+        }
+
+        copyPairs.push({ srcFile: commitFilesMap[sPath], dstPath: dPath });
+      }
+
+      const extraDelList = restoreExtraDeletes
+        .split(',')
+        .map((x) => x.trim().replace(/^\/+|\/+$/g, ''))
+        .filter(Boolean);
+
+      const deletePaths: { path: string; isFolder: boolean }[] = [];
+      for (const delP of extraDelList) {
+        if (currentHeadFiles.has(delP) && !copyPairs.some((cp) => cp.dstPath === delP)) {
+          pushLog(`🗑️ Menambahkan penghapusan file ekstra: ${delP}`);
+          deletePaths.push({ path: delP, isFolder: false });
+        }
+      }
+
+      await executeNdjsonCommit({
+        srcRepoId: parsed.repoId,
+        srcRepoType: parsed.repoType,
+        srcRevision: fullCommitId,
+        dstRepoId: parsed.repoId,
+        dstRepoType: parsed.repoType,
+        dstRevision: parsed.revision,
+        copyPairs,
+        deletePaths,
+        commitMessage: `Restore ${copyPairs.length} file(s) from commit ${shortId}`,
+        token: hfToken,
+        onLog: pushLog,
+      });
+
+      pushLog(`🎉 PEMULIHAN SELESAI 100%! (${copyPairs.length} file berhasil dikembalikan dari Commit ${shortId})`);
+      setRestoreStatus({
+        loading: false,
+        logs: [...logs],
+        successUrl: repoWebUrl(parsed.repoType, parsed.repoId, parsed.revision),
+      });
+
+      // Refresh tampilan commit otomatis
+      handleInspectCommits();
+    } catch (err: any) {
+      setRestoreStatus({
+        loading: false,
+        logs: [...logs],
+        error: err.message || String(err),
+      });
+    }
+  };
+
+  // ============================================================================
+  // 🚀 LOGIKA TAB 2: REPO-TO-REPO MOVER, COPIER & RENAMER
+  // ============================================================================
+  const handleLoadSourceFiles = async () => {
+    setMvLoadingFiles(true);
+    setMvStatus({ loading: false, logs: [] });
+    try {
+      const parsed = parseHfInput(mvSrcRepoInput, mvSrcPathInput, mvSrcType, mvSrcBranch);
+      setMvSrcRepoInput(parsed.repoId);
+      setMvSrcType(parsed.repoType);
+      setMvSrcBranch(parsed.revision);
+      if (parsed.subpath) {
+        setMvSrcPathInput(parsed.subpath);
+      }
+
+      const fileMap = await fetchCommitFileMap(parsed.repoId, parsed.repoType, parsed.revision, hfToken);
+      setMvSrcFilesMap(fileMap);
+
+      if (parsed.subpath && fileMap[parsed.subpath]) {
+        setMvSelectedPaths(new Set([parsed.subpath]));
+      } else {
+        setMvSelectedPaths(new Set());
+      }
+    } catch (err: any) {
+      setMvStatus({ loading: false, logs: [], error: `Gagal memuat daftar file repo asal: ${err.message}` });
+    } finally {
+      setMvLoadingFiles(false);
+    }
+  };
+
+  const toggleSelectFile = (path: string) => {
+    const next = new Set(mvSelectedPaths);
+    if (next.has(path)) {
+      next.delete(path);
+    } else {
+      next.add(path);
+      if (next.size === 1) {
+        setMvSrcPathInput(path);
+      } else {
+        setMvSrcPathInput('');
+      }
+    }
+    setMvSelectedPaths(next);
+  };
+
+  // Pratinjau Pemetaan File Asal ---> File Tujuan
+  const plannedMoveMappings = useMemo(() => {
+    const allFiles = Object.keys(mvSrcFilesMap).sort();
+    const cleanInputPath = mvSrcPathInput.trim().replace(/^\/+|\/+$/g, '');
+
+    let matched: string[] = [];
+    let isSingle = false;
+
+    if (mvSelectedPaths.size > 0) {
+      matched = Array.from(mvSelectedPaths).sort();
+      isSingle = matched.length === 1;
+    } else if (cleanInputPath === '*') {
+      matched = allFiles;
+    } else if (cleanInputPath && mvSrcFilesMap[cleanInputPath]) {
+      matched = [cleanInputPath];
+      isSingle = true;
+    } else if (cleanInputPath) {
+      const pref = cleanInputPath + '/';
+      matched = allFiles.filter((p) => p.startsWith(pref));
+    }
+
+    const targetSpec = mvDstNewName.trim();
+    if (matched.length === 0) return [];
+
+    if (isSingle) {
+      const sFile = matched[0];
+      const origFilename = sFile.split('/').pop() || sFile;
+      const extMatch = origFilename.match(/(\.[^./]+)$/);
+      const origExt = extMatch ? extMatch[1] : '';
+
+      let dstFile = sFile;
+      if (!targetSpec) {
+        dstFile = sFile;
+      } else if (['/', 'ROOT', '.'].includes(targetSpec)) {
+        dstFile = origFilename;
+      } else if (targetSpec.endsWith('/')) {
+        dstFile = `${targetSpec.replace(/^\/+|\/+$/g, '')}/${origFilename}`;
+      } else {
+        let cleanTarget = targetSpec.replace(/^\/+|\/+$/g, '');
+        const targetBase = cleanTarget.split('/').pop() || '';
+        if (origExt && !targetBase.includes('.')) {
+          cleanTarget += origExt;
+        }
+        dstFile = cleanTarget;
+      }
+      return [{ src: sFile, dst: dstFile }];
+    }
+
+    const srcPrefix = cleanInputPath && !['*', '/'].includes(cleanInputPath) ? cleanInputPath : '';
+    return matched.map((fPath) => {
+      const relPath = srcPrefix && fPath.startsWith(srcPrefix + '/') ? fPath.slice(srcPrefix.length + 1) : fPath;
+      let dstFile = fPath;
+      if (!targetSpec) {
+        dstFile = fPath;
+      } else if (['/', 'ROOT', '.'].includes(targetSpec)) {
+        dstFile = relPath;
+      } else {
+        const newFolder = targetSpec.replace(/^\/+|\/+$/g, '');
+        dstFile = relPath ? `${newFolder}/${relPath}` : newFolder;
+      }
+      return { src: fPath, dst: dstFile };
+    });
+  }, [mvSrcFilesMap, mvSelectedPaths, mvSrcPathInput, mvDstNewName]);
+
+  const handleExecuteMoveOrCopy = async () => {
+    if (!hfToken.trim()) {
+      setMvStatus({ loading: false, logs: [], error: 'Harap isi HF_TOKEN (Write Token) di bagian atas halaman terlebih dahulu!' });
+      return;
+    }
+
+    const logs: string[] = [];
+    const pushLog = (msg: string) => {
+      logs.push(msg);
+      setMvStatus((prev) => ({ ...prev, logs: [...logs] }));
+    };
+
+    setMvStatus({ loading: true, logs: ['🚀 Memulai proses Repo-to-Repo File Commander...'] });
+
+    try {
+      const srcParsed = parseHfInput(mvSrcRepoInput, mvSrcPathInput, mvSrcType, mvSrcBranch);
+      const dstParsed = parseHfInput(mvDstRepoInput, '', mvDstType, mvDstBranch);
+      const effectiveTargetName = mvDstNewName.trim() || dstParsed.subpath;
+
+      // Pastikan daftar file repo asal sudah dimuat
+      let srcMap = mvSrcFilesMap;
+      if (Object.keys(srcMap).length === 0) {
+        pushLog(`🔎 Mengambil daftar file dari repo asal ${srcParsed.repoId}...`);
+        srcMap = await fetchCommitFileMap(srcParsed.repoId, srcParsed.repoType, srcParsed.revision, hfToken);
+        setMvSrcFilesMap(srcMap);
+      }
+
+      const allSrcPaths = Object.keys(srcMap).sort();
+      const cleanSrcPath = srcParsed.subpath.replace(/^\/+|\/+$/g, '');
+
+      let matchedFiles: string[] = [];
+      let isSingleFile = false;
+
+      if (mvSelectedPaths.size > 0) {
+        matchedFiles = Array.from(mvSelectedPaths).filter((p) => p in srcMap).sort();
+        isSingleFile = matchedFiles.length === 1;
+      } else if (cleanSrcPath === '*') {
+        matchedFiles = allSrcPaths;
+      } else if (cleanSrcPath in srcMap) {
+        matchedFiles = [cleanSrcPath];
+        isSingleFile = true;
+      } else if (cleanSrcPath) {
+        const pref = cleanSrcPath + '/';
+        matchedFiles = allSrcPaths.filter((p) => p.startsWith(pref));
+      }
+
+      if (matchedFiles.length === 0) {
+        throw new Error(`Pilih minimal 1 file dari daftar atau masukkan nama file/folder asal yang valid di "${srcParsed.repoId}".`);
+      }
+
+      // Bangun mapping tujuan
+      let fileMapping: { src: string; dst: string }[] = [];
+      if (isSingleFile) {
+        const sFile = matchedFiles[0];
+        const origFilename = sFile.split('/').pop() || sFile;
+        const extMatch = origFilename.match(/(\.[^./]+)$/);
+        const origExt = extMatch ? extMatch[1] : '';
+
+        let dstFile = sFile;
+        if (!effectiveTargetName) {
+          dstFile = sFile;
+        } else if (['/', 'ROOT', '.'].includes(effectiveTargetName)) {
+          dstFile = origFilename;
+        } else if (effectiveTargetName.endsWith('/')) {
+          dstFile = `${effectiveTargetName.replace(/^\/+|\/+$/g, '')}/${origFilename}`;
+        } else {
+          let cleanT = effectiveTargetName.replace(/^\/+|\/+$/g, '');
+          const baseT = cleanT.split('/').pop() || '';
+          if (origExt && !baseT.includes('.')) cleanT += origExt;
+          dstFile = cleanT;
+        }
+        fileMapping = [{ src: sFile, dst: dstFile }];
+      } else {
+        const srcPref = cleanSrcPath && !['*', '/'].includes(cleanSrcPath) ? cleanSrcPath : '';
+        fileMapping = matchedFiles.map((fPath) => {
+          const rel = srcPref && fPath.startsWith(srcPref + '/') ? fPath.slice(srcPref.length + 1) : fPath;
+          let dstFile = fPath;
+          if (!effectiveTargetName) {
+            dstFile = fPath;
+          } else if (['/', 'ROOT', '.'].includes(effectiveTargetName)) {
+            dstFile = rel;
+          } else {
+            const nf = effectiveTargetName.replace(/^\/+|\/+$/g, '');
+            dstFile = rel ? `${nf}/${rel}` : nf;
+          }
+          return { src: fPath, dst: dstFile };
+        });
+      }
+
+      // Cek penghapusan diri sendiri
+      const isExactSameBranch =
+        srcParsed.repoId.toLowerCase() === dstParsed.repoId.toLowerCase() &&
+        srcParsed.repoType === dstParsed.repoType &&
+        srcParsed.revision === dstParsed.revision;
+
+      if (isExactSameBranch) {
+        const samePaths = fileMapping.filter((m) => m.src === m.dst);
+        if (samePaths.length > 0) {
+          throw new Error(
+            `Repo asal dan repo tujuan sama (${srcParsed.repoId}), tetapi nama tujuan tidak diubah (${samePaths[0].src}).`
+          );
+        }
+      }
+
+      pushLog(`📁 Memastikan repositori tujuan "${dstParsed.repoId}" siap...`);
+      await ensureRepoExists(dstParsed.repoId, dstParsed.repoType, mvPrivateTarget, hfToken);
+
+      // 🛡️ COLLISION GUARD (PENGECEKAN ANTI-TIMPA)
+      const existingDstMap = await fetchCommitFileMap(dstParsed.repoId, dstParsed.repoType, dstParsed.revision, hfToken).catch(
+        () => ({} as Record<string, HfFileItem>)
+      );
+      const occupiedDst = new Set(Object.keys(existingDstMap));
+      const conflicting = fileMapping.filter((m) => occupiedDst.has(m.dst));
+
+      if (conflicting.length > 0) {
+        if (mvCollisionMode === 'STOP_BATALKAN') {
+          const listStr = conflicting.slice(0, 5).map((c) => `"${c.dst}"`).join(', ');
+          throw new Error(
+            `🛑 PROSES DIBATALKAN DEMI KEAMANAN (ANTI-OVERWRITE GUARD AKTIF)! File tujuan ${listStr} SUDAH ADA di repo "${dstParsed.repoId}". Ganti nama tujuan atau ubah opsi ke AUTO_RENAME / OVERWRITE_TIMPA.`
+          );
+        } else if (mvCollisionMode === 'AUTO_RENAME') {
+          pushLog(`🛡️ Konflik nama terdeteksi! Mengaktifkan AUTO_RENAME agar file lama tidak tertimpa...`);
+          fileMapping = fileMapping.map((m) => {
+            if (!occupiedDst.has(m.dst)) {
+              occupiedDst.add(m.dst);
+              return m;
+            }
+            const slashIdx = m.dst.lastIndexOf('/');
+            const dir = slashIdx !== -1 ? m.dst.slice(0, slashIdx) : '';
+            const base = slashIdx !== -1 ? m.dst.slice(slashIdx + 1) : m.dst;
+            const dotIdx = base.lastIndexOf('.');
+            const stem = dotIdx !== -1 ? base.slice(0, dotIdx) : base;
+            const ext = dotIdx !== -1 ? base.slice(dotIdx) : '';
+            let cnt = 1;
+            let cand = '';
+            while (true) {
+              const candBase = `${stem}_${cnt}${ext}`;
+              cand = dir ? `${dir}/${candBase}` : candBase;
+              if (!occupiedDst.has(cand)) break;
+              cnt++;
+            }
+            occupiedDst.add(cand);
+            pushLog(`   🔄 "${m.dst}" ---> otomatis diubah menjadi "${cand}"`);
+            return { src: m.src, dst: cand };
+          });
+        } else {
+          pushLog(`⚠️ PERINGATAN: ${conflicting.length} file yang sudah ada di "${dstParsed.repoId}" akan DITIMPA sesuai pilihan OVERWRITE_TIMPA.`);
+        }
+      }
+
+      // Jika dalam 1 repo dan Move aktif, bisa disatukan dalam 1 commit atomik
+      const copyPairs = fileMapping.map((m) => ({
+        srcFile: srcMap[m.src],
+        dstPath: m.dst,
+      }));
+
+      await executeNdjsonCommit({
+        srcRepoId: srcParsed.repoId,
+        srcRepoType: srcParsed.repoType,
+        srcRevision: srcParsed.revision,
+        dstRepoId: dstParsed.repoId,
+        dstRepoType: dstParsed.repoType,
+        dstRevision: dstParsed.revision,
+        copyPairs,
+        deletePaths: [],
+        commitMessage: `Copy/Move ${copyPairs.length} file(s) from ${srcParsed.repoId}`,
+        token: hfToken,
+        onLog: pushLog,
+      });
+
+      // 🔬 VERIFIKASI KEBERADAAN FILE DI REPO TUJUAN SEBELUM HAPUS DARI ASAL
+      pushLog(`🔬 Memverifikasi keberadaan seluruh file di repositori tujuan (${dstParsed.repoId})...`);
+      const verifiedDstMap = await fetchCommitFileMap(dstParsed.repoId, dstParsed.repoType, dstParsed.revision, hfToken);
+      const missingDst = fileMapping.filter((m) => !(m.dst in verifiedDstMap));
+      if (missingDst.length > 0) {
+        throw new Error(
+          `❌ Verifikasi gagal! File ${missingDst.map((x) => x.dst).join(', ')} belum ditemukan di repo tujuan. Penghapusan dari repo asal dibatalkan demi keamanan!`
+        );
+      }
+      pushLog(`✅ Seluruh ${fileMapping.length} file terverifikasi 100% aman di "${dstParsed.repoId}"!`);
+
+      if (mvDeleteSource) {
+        pushLog(`🗑️ Menghapus ${fileMapping.length} file asal dari "${srcParsed.repoId}" (Mode Move/Cut)...`);
+        await executeNdjsonCommit({
+          srcRepoId: srcParsed.repoId,
+          srcRepoType: srcParsed.repoType,
+          srcRevision: srcParsed.revision,
+          dstRepoId: srcParsed.repoId,
+          dstRepoType: srcParsed.repoType,
+          dstRevision: srcParsed.revision,
+          copyPairs: [],
+          deletePaths: fileMapping.map((m) => ({ path: m.src, isFolder: false })),
+          commitMessage: `Delete moved file(s) after moving to ${dstParsed.repoId}`,
+          token: hfToken,
+          onLog: pushLog,
+        });
+        pushLog(`✅ File asal berhasil dihapus dari "${srcParsed.repoId}"!`);
+      }
+
+      pushLog(`🎉 PROSES SELESAI 100%!`);
+      const singleDownloadUrl =
+        fileMapping.length === 1
+          ? repoResolveUrl(dstParsed.repoType, dstParsed.repoId, dstParsed.revision, fileMapping[0].dst)
+          : undefined;
+
+      setMvStatus({
+        loading: false,
+        logs: [...logs],
+        successUrl: repoWebUrl(dstParsed.repoType, dstParsed.repoId, dstParsed.revision),
+        downloadUrl: singleDownloadUrl,
+      });
+    } catch (err: any) {
+      setMvStatus({
+        loading: false,
+        logs: [...logs],
+        error: err.message || String(err),
+      });
+    }
+  };
+
+  return (
+    <div className={`min-h-screen transition-colors duration-200 ${
+      isDark ? 'bg-slate-950 text-slate-100' : 'bg-slate-50 text-slate-900'
+    }`}>
+      {/* HEADER UTAMA */}
+      <header className={`sticky top-0 z-30 border-b backdrop-blur-md ${
+        isDark ? 'bg-slate-900/85 border-slate-800' : 'bg-white/85 border-slate-200'
+      }`}>
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 py-3.5 flex flex-wrap items-center justify-between gap-4">
+          <div className="flex items-center gap-3">
+            <div className="p-2.5 rounded-xl bg-gradient-to-br from-amber-500 to-orange-600 text-white shadow-lg shadow-orange-500/25">
+              <FolderGit2 className="w-6 h-6" />
+            </div>
+            <div>
+              <h1 className="text-lg sm:text-xl font-bold tracking-tight flex items-center gap-2">
+                HF Repo Studio
+                <span className="text-xs px-2.5 py-0.5 rounded-full font-semibold bg-amber-500/15 text-amber-400 border border-amber-500/30">
+                  Time Machine & Mover
+                </span>
+              </h1>
+              <p className={`text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'}`}>
+                Inspeksi Commit, 1-Click File Restore, & Server-Side Repo Mover (0 GB Kuota Download)
+              </p>
+            </div>
+          </div>
+
+          {/* NAVIGASI 2 FITUR UTAMA + TOMBOL TEMA */}
+          <div className="flex items-center gap-2.5">
+            <div className={`inline-flex rounded-xl p-1 border ${
+              isDark ? 'bg-slate-950 border-slate-800' : 'bg-slate-100 border-slate-200'
+            }`}>
+              <button
+                onClick={() => setActiveStudioTab('timemachine')}
+                className={`flex items-center gap-2 px-3.5 py-2 rounded-lg text-xs font-bold transition ${
+                  activeStudioTab === 'timemachine'
+                    ? 'bg-amber-500 text-slate-950 shadow'
+                    : isDark ? 'text-slate-400 hover:text-white' : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                <Clock className="w-4 h-4" />
+                🕰️ HF Time Machine
+              </button>
+              <button
+                onClick={() => setActiveStudioTab('mover')}
+                className={`flex items-center gap-2 px-3.5 py-2 rounded-lg text-xs font-bold transition ${
+                  activeStudioTab === 'mover'
+                    ? 'bg-amber-500 text-slate-950 shadow'
+                    : isDark ? 'text-slate-400 hover:text-white' : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                <ArrowRightLeft className="w-4 h-4" />
+                🚀 Repo-to-Repo Mover
+              </button>
+            </div>
+
+            <button
+              onClick={() => setIsDark(!isDark)}
+              className={`p-2.5 rounded-xl border transition ${
+                isDark
+                  ? 'bg-slate-800 border-slate-700 text-amber-400 hover:bg-slate-700'
+                  : 'bg-slate-100 border-slate-200 text-slate-700 hover:bg-slate-200'
+              }`}
+              title="Ganti Dark / Light Mode"
+            >
+              {isDark ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
+            </button>
+          </div>
+        </div>
+      </header>
+
+      <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6">
+        {/* =================================================================== */}
+        {/* 🔑 BARIS 1: PANEL TOKEN HUGGING FACE TERPADU                        */}
+        {/* =================================================================== */}
+        <div className={`rounded-2xl border p-4 sm:p-5 shadow-sm ${
+          isDark ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'
+        }`}>
+          <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+            <div className="flex-1 space-y-2">
+              <div className="flex items-center justify-between">
+                <label className="text-xs font-bold flex items-center gap-2">
+                  <Key className="w-4 h-4 text-amber-500" />
+                  Hugging Face Access Token (Izin <code className="text-amber-400">Write</code> untuk Restore & Move)
+                </label>
+                {userInfo && (
+                  <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-emerald-500/15 text-emerald-400 border border-emerald-500/30">
+                    <CheckCircle2 className="w-3.5 h-3.5" />
+                    Terhubung: {userInfo.name} ({userRepos.length} Repo)
+                  </span>
+                )}
+              </div>
+
+              <div className="flex flex-col sm:flex-row gap-2.5">
+                <div className="relative flex-1">
+                  <input
+                    type={showToken ? 'text' : 'password'}
+                    value={hfToken}
+                    onChange={(e) => setHfToken(e.target.value)}
+                    placeholder="hf_..."
+                    className={`w-full pl-3.5 pr-10 py-2 rounded-xl border text-xs font-mono focus:outline-none focus:ring-2 focus:ring-amber-500 ${
+                      isDark ? 'bg-slate-950 border-slate-800 text-slate-100' : 'bg-slate-50 border-slate-300 text-slate-900'
+                    }`}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowToken(!showToken)}
+                    className="absolute right-3 top-2.5 text-slate-400 hover:text-slate-200"
+                  >
+                    {showToken ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  </button>
+                </div>
+
+                <button
+                  onClick={() => handleVerifyToken(hfToken)}
+                  disabled={authLoading}
+                  className="px-4 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs flex items-center justify-center gap-1.5 transition shrink-0"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${authLoading ? 'animate-spin' : ''}`} />
+                  {authLoading ? 'Mengecek...' : 'Hubungkan & Muat Repo Saya'}
+                </button>
+
+                {hfToken && (
+                  <button
+                    onClick={() => {
+                      setHfToken('');
+                      setUserInfo(null);
+                      setUserRepos([]);
+                      localStorage.removeItem('hf_studio_token');
+                    }}
+                    className={`px-3 py-2 rounded-xl border text-xs font-medium flex items-center justify-center gap-1.5 transition ${
+                      isDark ? 'border-slate-800 hover:bg-slate-800 text-slate-400' : 'border-slate-300 hover:bg-slate-100 text-slate-600'
+                    }`}
+                    title="Hapus Token dari Layar & Browser"
+                  >
+                    <LogOut className="w-3.5 h-3.5" />
+                  </button>
+                )}
+              </div>
+
+              <div className="flex flex-wrap items-center justify-between gap-2 pt-1 text-[11px]">
+                <label className="flex items-center gap-2 cursor-pointer select-none opacity-80 hover:opacity-100">
+                  <input
+                    type="checkbox"
+                    checked={rememberToken}
+                    onChange={(e) => setRememberToken(e.target.checked)}
+                    className="rounded border-slate-600 text-amber-500 focus:ring-amber-500"
+                  />
+                  <span>Simpan token di browser perangkat ini (<code className="text-amber-400">localStorage</code> — aman, hanya di perangkat Anda)</span>
+                </label>
+
+                {authError && <span className="text-red-400 font-medium">{authError}</span>}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* DATALIST REPO MILIK USER AGAR INPUT REPO PUNYA AUTOCOMPLETE DROPDOWN */}
+        <datalist id="user-hf-repos">
+          {userRepos.map((r) => (
+            <option key={`${r.type}-${r.id}`} value={r.id}>
+              {r.type.toUpperCase()} {r.private ? '(Private)' : '(Public)'}
+            </option>
+          ))}
+        </datalist>
+
+        {/* =================================================================== */}
+        {/* 🕰️ TAB 1: HF TIME MACHINE (COMMIT INSPECTOR & RESTORER)             */}
+        {/* =================================================================== */}
+        {activeStudioTab === 'timemachine' && (
+          <div className="space-y-6">
+            {/* PANEL KONFIGURASI INSPEKSI */}
+            <div className={`rounded-2xl border p-5 shadow-sm space-y-4 ${
+              isDark ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'
+            }`}>
+              <div className="flex items-center justify-between flex-wrap gap-2">
+                <h2 className="font-bold text-sm sm:text-base flex items-center gap-2">
+                  <Clock className="w-5 h-5 text-amber-500" />
+                  1. Inspeksi Riwayat Commit & Deteksi File Tertimpa / Terhapus
+                </h2>
+                {userRepos.length > 0 && (
+                  <select
+                    onChange={(e) => {
+                      if (!e.target.value) return;
+                      const found = userRepos.find((r) => r.id === e.target.value);
+                      if (found) {
+                        setTmRepoInput(found.id);
+                        setTmRepoType(found.type);
+                      }
+                    }}
+                    value=""
+                    className={`px-3 py-1.5 rounded-xl border text-xs font-medium ${
+                      isDark ? 'bg-slate-950 border-slate-800 text-amber-400' : 'bg-slate-50 border-slate-300 text-slate-800'
+                    }`}
+                  >
+                    <option value="">⚡ Pilih Cepat dari Repo Saya ({userRepos.length})...</option>
+                    {userRepos.map((r) => (
+                      <option key={`${r.type}-${r.id}`} value={r.id}>
+                        [{r.type.toUpperCase()}] {r.id} {r.private ? '🔒' : ''}
+                      </option>
+                    ))}
+                  </select>
+                )}
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-12 gap-3">
+                <div className="sm:col-span-6">
+                  <label className="block text-xs font-medium mb-1 opacity-80">
+                    Repo ID (`username/nama-repo`) atau Link URL Repo HF
+                  </label>
+                  <input
+                    type="text"
+                    list="user-hf-repos"
+                    value={tmRepoInput}
+                    onChange={(e) => setTmRepoInput(e.target.value)}
+                    placeholder="SEVUNX/aestkr2 atau https://huggingface.co/SEVUNX/aestkr2"
+                    className={`w-full px-3.5 py-2 rounded-xl border text-xs font-mono ${
+                      isDark ? 'bg-slate-950 border-slate-800' : 'bg-slate-50 border-slate-300'
+                    }`}
+                  />
+                </div>
+
+                <div className="sm:col-span-2">
+                  <label className="block text-xs font-medium mb-1 opacity-80">Tipe Repo</label>
+                  <select
+                    value={tmRepoType}
+                    onChange={(e) => setTmRepoType(e.target.value as RepoType)}
+                    className={`w-full px-3 py-2 rounded-xl border text-xs ${
+                      isDark ? 'bg-slate-950 border-slate-800' : 'bg-slate-50 border-slate-300'
+                    }`}
+                  >
+                    <option value="model">model</option>
+                    <option value="dataset">dataset</option>
+                    <option value="space">space</option>
+                  </select>
+                </div>
+
+                <div className="sm:col-span-2">
+                  <label className="block text-xs font-medium mb-1 opacity-80">Branch</label>
+                  <input
+                    type="text"
+                    value={tmBranch}
+                    onChange={(e) => setTmBranch(e.target.value)}
+                    className={`w-full px-3 py-2 rounded-xl border text-xs font-mono ${
+                      isDark ? 'bg-slate-950 border-slate-800' : 'bg-slate-50 border-slate-300'
+                    }`}
+                  />
+                </div>
+
+                <div className="sm:col-span-2">
+                  <label className="block text-xs font-medium mb-1 opacity-80">
+                    Jumlah Commit ({tmMaxCommits})
+                  </label>
+                  <input
+                    type="number"
+                    min={2}
+                    max={25}
+                    value={tmMaxCommits}
+                    onChange={(e) => setTmMaxCommits(Number(e.target.value) || 8)}
+                    className={`w-full px-3 py-2 rounded-xl border text-xs font-mono text-center ${
+                      isDark ? 'bg-slate-950 border-slate-800' : 'bg-slate-50 border-slate-300'
+                    }`}
+                  />
+                </div>
+              </div>
+
+              <div className="flex justify-end">
+                <button
+                  onClick={handleInspectCommits}
+                  disabled={tmLoading}
+                  className="px-5 py-2.5 rounded-xl bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-slate-950 font-bold text-xs shadow-lg shadow-amber-500/20 flex items-center gap-2 transition"
+                >
+                  <Search className="w-4 h-4" />
+                  {tmLoading ? 'Memindai Riwayat Commit & Hash LFS...' : '🔍 Inspeksi Riwayat Commit'}
+                </button>
+              </div>
+            </div>
+
+            {tmError && (
+              <div className="rounded-2xl border border-red-500/40 bg-red-500/10 p-4 text-red-400 flex items-start gap-3 text-xs">
+                <AlertTriangle className="w-5 h-5 shrink-0" />
+                <div>
+                  <p className="font-bold">Gagal Memuat Riwayat Commit</p>
+                  <p className="mt-1">{tmError}</p>
+                </div>
+              </div>
+            )}
+
+            {/* 💡 PANEL REKOMENDASI PENYELAMATAN OTOMATIS (JIKA ADA FILE TERTIMPA / DIHAPUS) */}
+            {tmRescueHints.length > 0 && (
+              <div className="rounded-2xl border-2 border-amber-500/50 bg-amber-500/10 p-5 space-y-3">
+                <div className="flex items-center gap-2 text-amber-400 font-bold text-sm">
+                  <Sparkles className="w-5 h-5" />
+                  💡 DETEKSI OTOMATIS: Ditemukan {tmRescueHints.length} Kejadian File Tertimpa / Terhapus!
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  {tmRescueHints.map((h, i) => (
+                    <div
+                      key={i}
+                      className={`p-3.5 rounded-xl border flex flex-col justify-between gap-3 ${
+                        isDark ? 'bg-slate-950/90 border-slate-800' : 'bg-white border-amber-300'
+                      }`}
+                    >
+                      <div className="space-y-1 text-xs">
+                        <div className="flex items-center gap-2">
+                          <span className={`px-2 py-0.5 rounded font-bold text-[10px] ${
+                            h.type === 'OVERWRITTEN'
+                              ? 'bg-amber-500/20 text-amber-400'
+                              : 'bg-red-500/20 text-red-400'
+                          }`}>
+                            {h.type === 'OVERWRITTEN' ? '🟡 TERTIMPA!' : '🔴 DIHAPUS!'}
+                          </span>
+                          <span className="font-mono font-bold break-all">{h.path}</span>
+                        </div>
+                        <p className="text-[11px] opacity-80">
+                          Terjadi pada Commit <code>[{h.happenedAtCommitIdx}] ({h.happenedAtShortId})</code>.
+                        </p>
+                        <p className="text-[11px] text-emerald-400 font-mono">
+                          ✅ Versi Utuh Sebelumnya: {formatSize(h.oldFile.size)} | Hash: {h.oldFile.hash} (di Commit [{h.rescueCommitIdx}] {h.rescueShortId})
+                        </p>
+                      </div>
+
+                      <button
+                        onClick={() => handleSelectForRestore(h.rescueCommitId, h.path)}
+                        className="w-full py-2 px-3 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs flex items-center justify-center gap-1.5 transition"
+                      >
+                        <RotateCcw className="w-3.5 h-3.5" />
+                        ⚡ Siapkan Restore Versi Ini (Commit [{h.rescueCommitIdx}] {h.rescueShortId})
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* DAFTAR TIMELINE COMMIT */}
+            {tmCommits.length > 0 && (
+              <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 items-start">
+                {/* KOLOM KIRI (2/3): KARTU RIWAYAT COMMIT */}
+                <div className="lg:col-span-2 space-y-4">
+                  <div className="flex items-center justify-between text-xs opacity-75 px-1">
+                    <span>Menampilkan {tmCommits.length} dari {tmTotalCommits} total commit</span>
+                    <span>Klik tombol "Pulihkan" di samping file mana pun untuk mengisi form otomatis</span>
+                  </div>
+
+                  {tmCommits.map((c) => {
+                    const isExpanded = Boolean(expandedCommits[c.commitId]);
+                    const fileList = Object.values(c.files).sort((a, b) => a.path.localeCompare(b.path));
+                    const hasDiff =
+                      c.diff &&
+                      (c.diff.added.length > 0 || c.diff.deleted.length > 0 || c.diff.overwritten.length > 0);
+
+                    return (
+                      <div
+                        key={c.commitId}
+                        className={`rounded-2xl border overflow-hidden transition ${
+                          c.index === 0
+                            ? isDark
+                              ? 'bg-slate-900 border-emerald-500/40'
+                              : 'bg-white border-emerald-500/50'
+                            : isDark
+                            ? 'bg-slate-900 border-slate-800'
+                            : 'bg-white border-slate-200'
+                        }`}
+                      >
+                        {/* Header Commit */}
+                        <div className="p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-800/50">
+                          <div className="space-y-1">
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <span className="px-2 py-0.5 rounded-md font-mono text-xs font-bold bg-amber-500/20 text-amber-400">
+                                [{c.index}]
+                              </span>
+                              <code className="px-2 py-0.5 rounded bg-slate-800 text-slate-200 text-xs font-mono">
+                                {c.shortId}
+                              </code>
+                              <span className="text-xs opacity-70">{c.wibTime}</span>
+                              {c.index === 0 ? (
+                                <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/20 text-emerald-400">
+                                  📍 KONDISI SAAT INI (HEAD)
+                                </span>
+                              ) : (
+                                <span className="px-2 py-0.5 rounded-full text-[10px] font-medium bg-slate-800 text-slate-400">
+                                  📜 RIWAYAT LAMA #{c.index}
+                                </span>
+                              )}
+                            </div>
+                            <p className="font-semibold text-sm">{c.title}</p>
+                          </div>
+
+                          <div className="flex items-center gap-2 shrink-0">
+                            <button
+                              onClick={() => handleSelectForRestore(c.commitId, '*')}
+                              className={`px-2.5 py-1.5 rounded-lg border text-[11px] font-semibold flex items-center gap-1 transition ${
+                                isDark
+                                  ? 'border-slate-700 hover:bg-slate-800 text-slate-300'
+                                  : 'border-slate-300 hover:bg-slate-100 text-slate-700'
+                              }`}
+                              title="Pulihkan seluruh file dari commit ini"
+                            >
+                              <RotateCcw className="w-3 h-3" /> Pulihkan Semua (*)
+                            </button>
+                            <button
+                              onClick={() =>
+                                setExpandedCommits((prev) => ({ ...prev, [c.commitId]: !prev[c.commitId] }))
+                              }
+                              className={`px-3 py-1.5 rounded-lg border text-xs font-semibold flex items-center gap-1 ${
+                                isDark ? 'bg-slate-950 border-slate-800' : 'bg-slate-100 border-slate-200'
+                              }`}
+                            >
+                              📂 {fileList.length} File
+                              {isExpanded ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+                            </button>
+                          </div>
+                        </div>
+
+                        {/* Ringkasan Diff (Perubahan pada Commit ini) */}
+                        {hasDiff && c.diff && (
+                          <div className={`px-4 py-3 space-y-1.5 text-xs border-b ${
+                            isDark ? 'bg-slate-950/60 border-slate-800/60' : 'bg-slate-50 border-slate-200'
+                          }`}>
+                            <p className="font-semibold text-[11px] uppercase tracking-wider opacity-60">
+                              🔄 Perubahan pada Commit ini:
+                            </p>
+                            {c.diff.added.map((f) => (
+                              <div key={f.path} className="flex items-center justify-between gap-2 font-mono text-[11px] text-emerald-400">
+                                <span>🟢 [DITAMBAH] {f.path}</span>
+                                <span>{formatSize(f.size)} | Hash: {f.hash}</span>
+                              </div>
+                            ))}
+                            {c.diff.overwritten.map((ov) => (
+                              <div key={ov.path} className="p-2.5 rounded-xl bg-amber-500/10 border border-amber-500/30 space-y-1 font-mono text-[11px]">
+                                <div className="flex items-center justify-between gap-2 text-amber-400 font-bold">
+                                  <span>🟡 [TERTIMPA!] {ov.path}</span>
+                                  <button
+                                    onClick={() => handleSelectForRestore(ov.rescueCommitId, ov.path)}
+                                    className="px-2 py-0.5 rounded bg-amber-500 text-slate-950 font-sans font-bold text-[10px]"
+                                  >
+                                    ⚡ Pulihkan Versi Sebelum Tertimpa
+                                  </button>
+                                </div>
+                                <div className="opacity-80 pl-2 border-l-2 border-amber-500/40 space-y-0.5">
+                                  <div>├─ Versi Lama (Commit [{ov.rescueIndex}]): {formatSize(ov.oldFile.size)} | Hash: {ov.oldFile.hash}</div>
+                                  <div>└─ Versi Baru (Commit [{c.index}]): {formatSize(ov.newFile.size)} | Hash: {ov.newFile.hash}</div>
+                                </div>
+                              </div>
+                            ))}
+                            {c.diff.deleted.map((del) => (
+                              <div key={del.file.path} className="p-2 rounded-xl bg-red-500/10 border border-red-500/30 flex items-center justify-between gap-2 font-mono text-[11px] text-red-400">
+                                <span>
+                                  🔴 [DIHAPUS!] {del.file.path} ({formatSize(del.file.size)} | Hash: {del.file.hash})
+                                </span>
+                                <button
+                                  onClick={() => handleSelectForRestore(del.rescueCommitId, del.file.path)}
+                                  className="px-2 py-0.5 rounded bg-red-500 text-white font-sans font-bold text-[10px] shrink-0"
+                                >
+                                  ⚡ Pulihkan dari Commit [{del.rescueIndex}]
+                                </button>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+
+                        {/* Daftar Seluruh File di Commit Ini */}
+                        {isExpanded && (
+                          <div className="p-3 overflow-x-auto">
+                            <table className="w-full text-left border-collapse text-xs font-mono">
+                              <thead>
+                                <tr className={`border-b text-[11px] ${isDark ? 'border-slate-800 text-slate-400' : 'border-slate-200 text-slate-500'}`}>
+                                  <th className="py-2 px-2">Tipe</th>
+                                  <th className="py-2 px-2">Nama File / Path</th>
+                                  <th className="py-2 px-2">Ukuran</th>
+                                  <th className="py-2 px-2">Hash</th>
+                                  <th className="py-2 px-2 text-right">Aksi Cepat</th>
+                                </tr>
+                              </thead>
+                              <tbody className="divide-y divide-slate-800/40">
+                                {fileList.map((f) => (
+                                  <tr key={f.path} className={isDark ? 'hover:bg-slate-800/40' : 'hover:bg-slate-50'}>
+                                    <td className="py-2 px-2">
+                                      <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
+                                        f.isLfs ? 'bg-indigo-500/20 text-indigo-400' : 'bg-slate-700 text-slate-300'
+                                      }`}>
+                                        {f.isLfs ? 'LFS' : 'TXT'}
+                                      </span>
+                                    </td>
+                                    <td className="py-2 px-2 break-all font-medium">{f.path}</td>
+                                    <td className="py-2 px-2 text-emerald-400 whitespace-nowrap">{formatSize(f.size)}</td>
+                                    <td className="py-2 px-2 opacity-75">{f.hash}</td>
+                                    <td className="py-2 px-2 text-right whitespace-nowrap">
+                                      <button
+                                        onClick={() => handleSelectForRestore(c.commitId, f.path)}
+                                        className="px-2.5 py-1 rounded-lg bg-amber-500/15 hover:bg-amber-500 hover:text-slate-950 text-amber-400 font-sans font-bold text-[11px] transition"
+                                      >
+                                        🚑 Pulihkan Ini
+                                      </button>
+                                    </td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {/* KOLOM KANAN (1/3): PANEL EKSEKUSI PEMULIHAN (MODE 2) */}
+                <div
+                  id="restore-action-panel"
+                  className={`sticky top-20 rounded-2xl border p-5 shadow-lg space-y-4 ${
+                    isDark ? 'bg-slate-900 border-amber-500/40' : 'bg-white border-amber-500/50'
+                  }`}
+                >
+                  <h3 className="font-bold text-sm flex items-center gap-2 text-amber-400">
+                    <RotateCcw className="w-4 h-4" />
+                    2. Panel Eksekusi Pemulihan (Restore)
+                  </h3>
+                  <p className="text-[11px] opacity-75">
+                    Klik tombol <strong>"🚑 Pulihkan Ini"</strong> pada daftar file di kiri, atau isi manual di bawah ini. Proses berjalan 100% Server-Side (0 GB Download).
+                  </p>
+
+                  <div>
+                    <label className="block text-xs font-medium mb-1">
+                      Commit ID atau Nomor Urut <code>[index]</code>
+                    </label>
+                    <input
+                      type="text"
+                      value={restoreCommitId}
+                      onChange={(e) => setRestoreCommitId(e.target.value)}
+                      placeholder="Contoh: 4c65a966 atau 1"
+                      className={`w-full px-3 py-2 rounded-xl border text-xs font-mono ${
+                        isDark ? 'bg-slate-950 border-slate-800' : 'bg-slate-50 border-slate-300'
+                      }`}
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-medium mb-1">
+                      Path File / Folder di Commit Tersebut (atau <code>*</code>)
+                    </label>
+                    <input
+                      type="text"
+                      value={restoreSrcPath}
+                      onChange={(e) => setRestoreSrcPath(e.target.value)}
+                      placeholder="Contoh: model.safetensors atau *"
+                      className={`w-full px-3 py-2 rounded-xl border text-xs font-mono ${
+                        isDark ? 'bg-slate-950 border-slate-800' : 'bg-slate-50 border-slate-300'
+                      }`}
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-medium mb-1">
+                      Simpan Sebagai Nama Baru (Opsional)
+                    </label>
+                    <input
+                      type="text"
+                      value={restoreNewName}
+                      onChange={(e) => setRestoreNewName(e.target.value)}
+                      placeholder="Kosongkan jika ingin kembali ke nama asli"
+                      className={`w-full px-3 py-2 rounded-xl border text-xs font-mono ${
+                        isDark ? 'bg-slate-950 border-slate-800' : 'bg-slate-50 border-slate-300'
+                      }`}
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-medium mb-1">
+                      Jika Nama File Sudah Ada di Repo Saat Ini:
+                    </label>
+                    <select
+                      value={restoreConflictMode}
+                      onChange={(e) => setRestoreConflictMode(e.target.value as any)}
+                      className={`w-full px-3 py-2 rounded-xl border text-xs ${
+                        isDark ? 'bg-slate-950 border-slate-800' : 'bg-slate-50 border-slate-300'
+                      }`}
+                    >
+                      <option value="OVERWRITE">TIMPA & Kembalikan Versi Commit Lama</option>
+                      <option value="SUFFIX_PULIH">Jangan Timpa (Simpan dengan Akhiran _PULIH)</option>
+                      <option value="ABORT">Batalkan Jika Nama Sudah Ada</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-medium mb-1">
+                      Sekalian Hapus File Lain / Salah (Opsional, pisah koma)
+                    </label>
+                    <input
+                      type="text"
+                      value={restoreExtraDeletes}
+                      onChange={(e) => setRestoreExtraDeletes(e.target.value)}
+                      placeholder="file_salah.safetensors"
+                      className={`w-full px-3 py-2 rounded-xl border text-xs font-mono ${
+                        isDark ? 'bg-slate-950 border-slate-800' : 'bg-slate-50 border-slate-300'
+                      }`}
+                    />
+                  </div>
+
+                  <button
+                    onClick={handleExecuteRestore}
+                    disabled={restoreStatus.loading}
+                    className="w-full py-2.5 px-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-bold text-xs shadow-lg shadow-emerald-600/25 flex items-center justify-center gap-2 transition"
+                  >
+                    <RotateCcw className="w-4 h-4" />
+                    {restoreStatus.loading ? 'Memulihkan di Server HF...' : '🚑 Eksekusi Pulihkan Sekarang'}
+                  </button>
+
+                  {/* Log Status Restore */}
+                  {(restoreStatus.logs.length > 0 || restoreStatus.error) && (
+                    <div className={`p-3 rounded-xl border text-[11px] font-mono space-y-1.5 ${
+                      isDark ? 'bg-slate-950 border-slate-800' : 'bg-slate-50 border-slate-200'
+                    }`}>
+                      {restoreStatus.logs.map((l, i) => (
+                        <div key={i} className="leading-relaxed">{l}</div>
+                      ))}
+                      {restoreStatus.error && (
+                        <div className="text-red-400 font-bold pt-1">❌ {restoreStatus.error}</div>
+                      )}
+                      {restoreStatus.successUrl && (
+                        <a
+                          href={restoreStatus.successUrl}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="mt-2 inline-flex items-center gap-1.5 text-emerald-400 font-sans font-bold hover:underline"
+                        >
+                          🔗 Buka Repo Hasil Pemulihan <ExternalLink className="w-3.5 h-3.5" />
+                        </a>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* =================================================================== */}
+        {/* 🚀 TAB 2: HF REPO-TO-REPO MOVER, COPIER & RENAMER                   */}
+        {/* =================================================================== */}
+        {activeStudioTab === 'mover' && (
+          <div className="space-y-6">
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+              {/* PANEL KIRI: SUMBER (REPO ASAL) */}
+              <div className={`rounded-2xl border p-5 shadow-sm space-y-4 ${
+                isDark ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'
+              }`}>
+                <div className="flex items-center justify-between flex-wrap gap-2">
+                  <h2 className="font-bold text-sm sm:text-base flex items-center gap-2">
+                    <FileBox className="w-5 h-5 text-indigo-400" />
+                    1. Sumber File / Folder (Repo Asal)
+                  </h2>
+                  {userRepos.length > 0 && (
+                    <select
+                      onChange={(e) => {
+                        if (!e.target.value) return;
+                        const found = userRepos.find((r) => r.id === e.target.value);
+                        if (found) {
+                          setMvSrcRepoInput(found.id);
+                          setMvSrcType(found.type);
+                        }
+                      }}
+                      value=""
+                      className={`px-3 py-1 rounded-xl border text-xs ${
+                        isDark ? 'bg-slate-950 border-slate-800 text-indigo-400' : 'bg-slate-50 border-slate-300'
+                      }`}
+                    >
+                      <option value="">⚡ Pilih Repo Asal Saya...</option>
+                      {userRepos.map((r) => (
+                        <option key={`src-${r.type}-${r.id}`} value={r.id}>
+                          [{r.type.toUpperCase()}] {r.id}
+                        </option>
+                      ))}
+                    </select>
+                  )}
+                </div>
+
+                <div className="space-y-3">
+                  <div>
+                    <label className="block text-xs font-medium mb-1 opacity-80">
+                      Link URL File/Repo HF <strong>ATAU</strong> Nama Repo Asal (`username/repo`)
+                    </label>
+                    <input
+                      type="text"
+                      list="user-hf-repos"
+                      value={mvSrcRepoInput}
+                      onChange={(e) => setMvSrcRepoInput(e.target.value)}
+                      placeholder="https://huggingface.co/SEVUNX/redkrea/resolve/main/model.safetensors"
+                      className={`w-full px-3.5 py-2 rounded-xl border text-xs font-mono ${
+                        isDark ? 'bg-slate-950 border-slate-800' : 'bg-slate-50 border-slate-300'
+                      }`}
+                    />
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-xs font-medium mb-1 opacity-80">Tipe Repo Asal</label>
+                      <select
+                        value={mvSrcType}
+                        onChange={(e) => setMvSrcType(e.target.value as RepoType)}
+                        className={`w-full px-3 py-2 rounded-xl border text-xs ${
+                          isDark ? 'bg-slate-950 border-slate-800' : 'bg-slate-50 border-slate-300'
+                        }`}
+                      >
+                        <option value="model">model</option>
+                        <option value="dataset">dataset</option>
+                        <option value="space">space</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label className="block text-xs font-medium mb-1 opacity-80">Branch Asal</label>
+                      <input
+                        type="text"
+                        value={mvSrcBranch}
+                        onChange={(e) => setMvSrcBranch(e.target.value)}
+                        className={`w-full px-3 py-2 rounded-xl border text-xs font-mono ${
+                          isDark ? 'bg-slate-950 border-slate-800' : 'bg-slate-50 border-slate-300'
+                        }`}
+                      />
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-medium mb-1 opacity-80">
+                      Path File / Folder di Repo Asal (Opsional jika sudah pakai URL atau centang tabel di bawah)
+                    </label>
+                    <div className="flex gap-2">
+                      <input
+                        type="text"
+                        value={mvSrcPathInput}
+                        onChange={(e) => {
+                          setMvSrcPathInput(e.target.value);
+                          setMvSelectedPaths(new Set());
+                        }}
+                        placeholder="Contoh: model.safetensors atau ketik * untuk semua file"
+                        className={`flex-1 px-3.5 py-2 rounded-xl border text-xs font-mono ${
+                          isDark ? 'bg-slate-950 border-slate-800' : 'bg-slate-50 border-slate-300'
+                        }`}
+                      />
+                      <button
+                        onClick={handleLoadSourceFiles}
+                        disabled={mvLoadingFiles}
+                        className="px-3.5 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold flex items-center gap-1.5 shrink-0 transition"
+                      >
+                        <RefreshCw className={`w-3.5 h-3.5 ${mvLoadingFiles ? 'animate-spin' : ''}`} />
+                        Muat Daftar File
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Pemilih File Visual Repo Asal */}
+                {Object.keys(mvSrcFilesMap).length > 0 && (
+                  <div className={`p-3.5 rounded-xl border space-y-2.5 ${
+                    isDark ? 'bg-slate-950/70 border-slate-800' : 'bg-slate-50 border-slate-200'
+                  }`}>
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-xs font-bold text-indigo-400">
+                        📂 Pilih / Centang File dari Repo Asal ({mvSelectedPaths.size} dipilih)
+                      </span>
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={() => setMvSelectedPaths(new Set(Object.keys(mvSrcFilesMap)))}
+                          className="text-[11px] text-amber-400 hover:underline font-medium"
+                        >
+                          Pilih Semua
+                        </button>
+                        <button
+                          onClick={() => setMvSelectedPaths(new Set())}
+                          className="text-[11px] opacity-70 hover:underline"
+                        >
+                          Reset
+                        </button>
+                      </div>
+                    </div>
+
+                    <input
+                      type="text"
+                      value={mvFileSearch}
+                      onChange={(e) => setMvFileSearch(e.target.value)}
+                      placeholder="Cari nama file di repo asal..."
+                      className={`w-full px-3 py-1.5 rounded-lg border text-xs font-mono ${
+                        isDark ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-300'
+                      }`}
+                    />
+
+                    <div className="max-h-56 overflow-y-auto divide-y divide-slate-800/40 text-xs font-mono">
+                      {Object.values(mvSrcFilesMap)
+                        .filter((f) => !mvFileSearch || f.path.toLowerCase().includes(mvFileSearch.toLowerCase()))
+                        .map((f) => {
+                          const checked = mvSelectedPaths.has(f.path);
+                          return (
+                            <label
+                              key={f.path}
+                              className={`py-2 px-2 flex items-center justify-between gap-2 cursor-pointer rounded transition ${
+                                checked
+                                  ? 'bg-indigo-500/15 text-indigo-300'
+                                  : isDark ? 'hover:bg-slate-900' : 'hover:bg-slate-100'
+                              }`}
+                            >
+                              <div className="flex items-center gap-2.5 min-w-0">
+                                <input
+                                  type="checkbox"
+                                  checked={checked}
+                                  onChange={() => toggleSelectFile(f.path)}
+                                  className="rounded border-slate-600 text-indigo-600"
+                                />
+                                <span className="truncate font-medium">{f.path}</span>
+                              </div>
+                              <span className="text-[11px] text-emerald-400 shrink-0">{formatSize(f.size)}</span>
+                            </label>
+                          );
+                        })}
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* PANEL KANAN: TUJUAN, RENAME & ANTI-OVERWRITE GUARD */}
+              <div className={`rounded-2xl border p-5 shadow-sm space-y-4 ${
+                isDark ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'
+              }`}>
+                <div className="flex items-center justify-between flex-wrap gap-2">
+                  <h2 className="font-bold text-sm sm:text-base flex items-center gap-2">
+                    <ArrowRightLeft className="w-5 h-5 text-emerald-400" />
+                    2. Tujuan (Repo Target), Ganti Nama & Proteksi
+                  </h2>
+                  {userRepos.length > 0 && (
+                    <select
+                      onChange={(e) => {
+                        if (!e.target.value) return;
+                        const found = userRepos.find((r) => r.id === e.target.value);
+                        if (found) {
+                          setMvDstRepoInput(found.id);
+                          setMvDstType(found.type);
+                        }
+                      }}
+                      value=""
+                      className={`px-3 py-1 rounded-xl border text-xs ${
+                        isDark ? 'bg-slate-950 border-slate-800 text-emerald-400' : 'bg-slate-50 border-slate-300'
+                      }`}
+                    >
+                      <option value="">⚡ Pilih Repo Tujuan Saya...</option>
+                      {userRepos.map((r) => (
+                        <option key={`dst-${r.type}-${r.id}`} value={r.id}>
+                          [{r.type.toUpperCase()}] {r.id}
+                        </option>
+                      ))}
+                    </select>
+                  )}
+                </div>
+
+                <div className="space-y-3">
+                  <div>
+                    <label className="block text-xs font-medium mb-1 opacity-80">
+                      Repo Tujuan (`username/nama-repo` — otomatis dibuat jika belum ada)
+                    </label>
+                    <input
+                      type="text"
+                      list="user-hf-repos"
+                      value={mvDstRepoInput}
+                      onChange={(e) => setMvDstRepoInput(e.target.value)}
+                      placeholder="SEVUNX/aestkr2"
+                      className={`w-full px-3.5 py-2 rounded-xl border text-xs font-mono ${
+                        isDark ? 'bg-slate-950 border-slate-800' : 'bg-slate-50 border-slate-300'
+                      }`}
+                    />
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-xs font-medium mb-1 opacity-80">Tipe Repo Tujuan</label>
+                      <select
+                        value={mvDstType}
+                        onChange={(e) => setMvDstType(e.target.value as RepoType)}
+                        className={`w-full px-3 py-2 rounded-xl border text-xs ${
+                          isDark ? 'bg-slate-950 border-slate-800' : 'bg-slate-50 border-slate-300'
+                        }`}
+                      >
+                        <option value="model">model</option>
+                        <option value="dataset">dataset</option>
+                        <option value="space">space</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label className="block text-xs font-medium mb-1 opacity-80">Branch Tujuan</label>
+                      <input
+                        type="text"
+                        value={mvDstBranch}
+                        onChange={(e) => setMvDstBranch(e.target.value)}
+                        className={`w-full px-3 py-2 rounded-xl border text-xs font-mono ${
+                          isDark ? 'bg-slate-950 border-slate-800' : 'bg-slate-50 border-slate-300'
+                        }`}
+                      />
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-medium mb-1 opacity-80">
+                      Ganti Nama Baru / Folder Tujuan (`target_new_name_or_path` — Opsional)
+                    </label>
+                    <input
+                      type="text"
+                      value={mvDstNewName}
+                      onChange={(e) => setMvDstNewName(e.target.value)}
+                      placeholder="Kosongkan untuk nama asli, ketik nama baru, atau '/' untuk taruh di root"
+                      className={`w-full px-3.5 py-2 rounded-xl border text-xs font-mono ${
+                        isDark ? 'bg-slate-950 border-slate-800' : 'bg-slate-50 border-slate-300'
+                      }`}
+                    />
+                  </div>
+
+                  {/* Pengaman Anti-Timpa */}
+                  <div>
+                    <label className="flex items-center gap-1.5 text-xs font-bold mb-1 text-amber-400">
+                      <ShieldCheck className="w-4 h-4" />
+                      Pengaman Anti-Timpa (Jika Nama File Sudah Ada di Repo Tujuan)
+                    </label>
+                    <select
+                      value={mvCollisionMode}
+                      onChange={(e) => setMvCollisionMode(e.target.value as any)}
+                      className={`w-full px-3 py-2 rounded-xl border text-xs font-medium ${
+                        isDark ? 'bg-slate-950 border-slate-800' : 'bg-slate-50 border-slate-300'
+                      }`}
+                    >
+                      <option value="STOP_BATALKAN">🛑 STOP_BATALKAN (Aman - Tolak Jika Nama Sudah Ada)</option>
+                      <option value="AUTO_RENAME">🔄 AUTO_RENAME (Otomatis Tambah _1, _2, dst)</option>
+                      <option value="OVERWRITE_TIMPA">⚠️ OVERWRITE_TIMPA (Timpa File Lama)</option>
+                    </select>
+                  </div>
+
+                  <div className="pt-1 space-y-2 text-xs">
+                    <label className="flex items-center gap-2.5 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={mvPrivateTarget}
+                        onChange={(e) => setMvPrivateTarget(e.target.checked)}
+                        className="rounded border-slate-600 text-indigo-600"
+                      />
+                      <span>Buat sebagai <strong>Private Repo</strong> (jika repo tujuan belum ada)</span>
+                    </label>
+
+                    <label className="flex items-center gap-2.5 cursor-pointer text-amber-400 font-medium">
+                      <input
+                        type="checkbox"
+                        checked={mvDeleteSource}
+                        onChange={(e) => setMvDeleteSource(e.target.checked)}
+                        className="rounded border-slate-600 text-amber-500"
+                      />
+                      <span>
+                        🗑️ <strong>Hapus dari Repo Asal (Move / Cut)</strong> setelah file terverifikasi 100% aman di tujuan
+                      </span>
+                    </label>
+                  </div>
+                </div>
+
+                {/* Pratinjau Pemetaan File */}
+                {plannedMoveMappings.length > 0 && (
+                  <div className={`p-3 rounded-xl border text-[11px] font-mono space-y-1 ${
+                    isDark ? 'bg-slate-950/80 border-slate-800' : 'bg-slate-50 border-slate-200'
+                  }`}>
+                    <div className="font-sans font-bold text-indigo-400 mb-1">
+                      📋 Pratinjau Pemetaan ({plannedMoveMappings.length} file):
+                    </div>
+                    {plannedMoveMappings.slice(0, 6).map((m, i) => (
+                      <div key={i} className="flex items-center gap-2 break-all">
+                        <span className="opacity-75">{m.src}</span>
+                        <ArrowRight className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                        <span className="text-emerald-400 font-bold">{m.dst}</span>
+                      </div>
+                    ))}
+                    {plannedMoveMappings.length > 6 && (
+                      <div className="opacity-60">... dan {plannedMoveMappings.length - 6} file lainnya</div>
+                    )}
+                  </div>
+                )}
+
+                <button
+                  onClick={handleExecuteMoveOrCopy}
+                  disabled={mvStatus.loading}
+                  className="w-full py-3 px-5 rounded-xl bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-slate-950 font-bold text-xs shadow-lg shadow-amber-500/25 flex items-center justify-center gap-2 transition"
+                >
+                  <ArrowRightLeft className="w-4 h-4" />
+                  {mvStatus.loading
+                    ? 'Memproses Transfer Server-Side...'
+                    : mvDeleteSource
+                    ? '✂️ Eksekusi Pindahkan (Move) Sekarang'
+                    : '📋 Eksekusi Salin (Copy) Sekarang'}
+                </button>
+
+                {/* Log Eksekusi Mover */}
+                {(mvStatus.logs.length > 0 || mvStatus.error) && (
+                  <div className={`p-3.5 rounded-xl border text-xs font-mono space-y-1.5 ${
+                    isDark ? 'bg-slate-950 border-slate-800' : 'bg-slate-50 border-slate-200'
+                  }`}>
+                    {mvStatus.logs.map((l, i) => (
+                      <div key={i}>{l}</div>
+                    ))}
+                    {mvStatus.error && (
+                      <div className="text-red-400 font-bold pt-1">❌ {mvStatus.error}</div>
+                    )}
+                    {mvStatus.successUrl && (
+                      <div className="pt-2 flex flex-wrap gap-3 font-sans font-bold">
+                        <a
+                          href={mvStatus.successUrl}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="inline-flex items-center gap-1 text-emerald-400 hover:underline"
+                        >
+                          🔗 Buka Repo Tujuan <ExternalLink className="w-3.5 h-3.5" />
+                        </a>
+                        {mvStatus.downloadUrl && (
+                          <a
+                            href={mvStatus.downloadUrl}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="inline-flex items-center gap-1 text-indigo-400 hover:underline"
+                          >
+                            📥 Link Download Langsung <ExternalLink className="w-3.5 h-3.5" />
+                          </a>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+      </main>
+    </div>
+  );
+}

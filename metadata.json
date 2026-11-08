@@ -1,0 +1,6 @@
+{
+  "name": "HF Repo Studio — Time Machine & File Commander",
+  "description": "Inspeksi riwayat commit Hugging Face, 1-Click File Restore dari file tertimpa atau terhapus, dan Server-Side Repo-to-Repo File Mover & Renamer (0 GB kuota unduhan).",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
